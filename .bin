@@ -1,0 +1,431 @@
+#include <HardwareSerial.h>
+#include <ModbusMaster.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+const char* ssid = "ROOM204_2.4GHz";
+const char* password = "0656076916R204";
+
+HardwareSerial mySerial(2);
+
+#define MAX485_DE      4
+#define MAX485_RE_NEG  5
+
+#define HISTORY_SIZE 60
+
+float tempHistory[HISTORY_SIZE];
+float humHistory[HISTORY_SIZE];
+int historyIndex = 0;
+bool historyFilled = false;
+
+ModbusMaster node;
+
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+WebServer server(80);
+
+// ฟังก์ชัน pre/post transmission ของ Modbus
+void preTransmission()
+{
+  digitalWrite(MAX485_RE_NEG, HIGH);
+  digitalWrite(MAX485_DE, HIGH);
+}
+
+void postTransmission()
+{
+  digitalWrite(MAX485_RE_NEG, LOW);
+  digitalWrite(MAX485_DE, LOW);
+}
+
+float average(float* data, int size) {
+  if (size == 0) return 0;
+  float sum = 0;
+  for (int i = 0; i < size; i++) sum += data[i];
+  return sum / size;
+}
+
+String checkComfort(float temp, float hum) {
+  bool temp_ok = (temp >= 20.0 && temp <= 30.0);
+  bool hum_ok = (hum >= 30.0 && hum <= 60.0);
+
+  if (temp_ok && hum_ok) return "Comfortable";
+  else if (!temp_ok && hum_ok) return "Temp Out of Range";
+  else if (temp_ok && !hum_ok) return "Humidity Out of Range";
+  else return "Temp & Hum Out of Range";
+}
+
+// API JSON endpoint
+void handleApiData() {
+  int count = historyFilled ? HISTORY_SIZE : historyIndex;
+  float avgTemperature = average(tempHistory, count);
+  float avgHumidity = average(humHistory, count);
+
+  String comfort = checkComfort(avgTemperature, avgHumidity);
+
+  String json = "{";
+  json += "\"avgTemperature\":" + String(avgTemperature, 1) + ",";
+  json += "\"avgHumidity\":" + String(avgHumidity, 1) + ",";
+  json += "\"comfort\":\"" + comfort + "\"";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+const char webpage_template[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Monitor Temp & Humidity</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
+
+  /* Reset */
+  * {
+    box-sizing: border-box;
+  }
+  body, html {
+    margin: 0; padding: 0; height: 100%;
+    background: #F9FAFB;
+    font-family: 'Inter', sans-serif;
+    color: #333;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+
+  .card {
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 8px 24px rgba(100, 100, 111, 0.2);
+    width: 380px;
+    padding: 32px 36px;
+    text-align: center;
+  }
+
+  h1 {
+    font-weight: 700;
+    font-size: 1.8rem;
+    margin-bottom: 28px;
+    color: #111827;
+    letter-spacing: 0.05em;
+  }
+
+  .metric {
+    margin-bottom: 28px;
+  }
+  .label {
+    font-weight: 600;
+    font-size: 1.1rem;
+    color: #6B7280;
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .value {
+    font-size: 2.6rem;
+    font-weight: 700;
+    color: #2563EB;
+    margin-bottom: 12px;
+  }
+
+  .progress-bar {
+    position: relative;
+    width: 100%;
+    height: 18px;
+    background: #E5E7EB;
+    border-radius: 9px;
+    overflow: hidden;
+    box-shadow: inset 0 1px 3px rgb(0 0 0 / 0.1);
+  }
+  .progress-bar-fill {
+    height: 100%;
+    border-radius: 9px 0 0 9px;
+    width: 0;
+    transition: width 0.8s ease-in-out;
+  }
+
+  /* Colors for bars */
+  .temp-fill {
+    background: linear-gradient(90deg, #FDBA74, #F97316); /* amber to orange */
+  }
+  .hum-fill {
+    background: linear-gradient(90deg, #93C5FD, #3B82F6); /* light blue to blue */
+  }
+
+  .desc {
+    font-size: 0.9rem;
+    color: #4B5563;
+    margin-top: 6px;
+    min-height: 24px;
+  }
+
+  .status-box {
+    margin-top: 36px;
+    padding: 18px 0;
+    border-radius: 12px;
+    font-weight: 700;
+    font-size: 1.3rem;
+    color: #fff;
+    user-select: none;
+    box-shadow: 0 4px 12px rgb(0 0 0 / 0.1);
+    transition: background-color 0.5s ease;
+  }
+  .status-comfortable {
+    background-color: #22C55E; /* green */
+  }
+  .status-uncomfortable {
+    background-color: #EF4444; /* red */
+  }
+  .status-icon {
+    margin-right: 10px;
+    vertical-align: middle;
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h1>อุณหภูมิ &amp; ความชื้น</h1>
+
+  <div class="metric">
+    <div class="label">อุณหภูมิเฉลี่ย</div>
+    <div class="value" id="avgTemp">-- °C</div>
+    <div class="progress-bar" aria-label="Temperature progress bar">
+      <div class="progress-bar-fill temp-fill" id="tempProgress"></div>
+    </div>
+    <div class="desc" id="tempDesc"></div>
+  </div>
+
+  <div class="metric">
+    <div class="label">ความชื้นเฉลี่ย</div>
+    <div class="value" id="avgHum">-- %</div>
+    <div class="progress-bar" aria-label="Humidity progress bar">
+      <div class="progress-bar-fill hum-fill" id="humProgress"></div>
+    </div>
+    <div class="desc" id="humDesc"></div>
+  </div>
+
+  <div id="comfortStatus" class="status-box status-uncomfortable">
+    <svg class="status-icon" xmlns="http://www.w3.org/2000/svg" fill="none" height="24" width="24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="10"></circle>
+      <line x1="15" y1="9" x2="9" y2="15"></line>
+      <line x1="9" y1="9" x2="15" y2="15"></line>
+    </svg>
+    กำลังโหลดข้อมูล...
+  </div>
+</div>
+
+<script>
+  function describeHumidity(hum) {
+    if (hum < 30) return "ความชื้นแห้งเกินไป";
+    else if (hum > 60) return "ความชื้นสูงเกินไป";
+    else return "ความชื้นเหมาะสม";
+  }
+
+  function describeTemperature(temp) {
+    if (temp < 20) return "อากาศเย็นสบาย";
+    else if (temp <= 25) return "อากาศสบาย";
+    else if (temp <= 30) return "อากาศเริ่มร้อน";
+    else return "อากาศร้อนเกินไป";
+  }
+
+  function checkComfort(temp, hum) {
+    const tempOk = temp >= 20 && temp <= 30;
+    const humOk = hum >= 30 && hum <= 60;
+    return (tempOk && humOk);
+  }
+
+  function updateStatus(comfortable) {
+    const statusDiv = document.getElementById('comfortStatus');
+    if (comfortable) {
+      statusDiv.className = 'status-box status-comfortable';
+      statusDiv.innerHTML = `
+        <svg class="status-icon" xmlns="http://www.w3.org/2000/svg" fill="none" height="24" width="24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="10"></circle>
+          <path d="M16 12l-4-4-4 4m8 4l-4-4-4 4"></path>
+        </svg>
+        สบายตัว 👍
+      `;
+    } else {
+      statusDiv.className = 'status-box status-uncomfortable';
+      statusDiv.innerHTML = `
+        <svg class="status-icon" xmlns="http://www.w3.org/2000/svg" fill="none" height="24" width="24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="10"></circle>
+          <line x1="15" y1="9" x2="9" y2="15"></line>
+          <line x1="9" y1="9" x2="15" y2="15"></line>
+        </svg>
+        ไม่สบายตัว⚠️
+      `;
+    }
+  }
+
+  async function fetchData() {
+    try {
+      const response = await fetch('/data');
+      if (!response.ok) throw new Error('Network response was not ok');
+      const data = await response.json();
+
+      const avgTemp = data.avgTemperature;
+      const avgHum = data.avgHumidity;
+      const comfort = checkComfort(avgTemp, avgHum);
+
+      // อัพเดตค่าบนหน้าเว็บ
+      document.getElementById('avgTemp').textContent = avgTemp.toFixed(1) + " °C";
+      document.getElementById('tempProgress').style.width = Math.min(Math.max(avgTemp, 0), 50) * 2 + "%";
+      document.getElementById('tempDesc').textContent = describeTemperature(avgTemp);
+
+      document.getElementById('avgHum').textContent = avgHum.toFixed(1) + " %";
+      document.getElementById('humProgress').style.width = Math.min(Math.max(avgHum, 0), 100) + "%";
+      document.getElementById('humDesc').textContent = describeHumidity(avgHum);
+
+      updateStatus(comfort);
+    } catch (error) {
+      const statusDiv = document.getElementById('comfortStatus');
+      statusDiv.className = "status-box status-uncomfortable";
+      statusDiv.textContent = "ไม่สามารถโหลดข้อมูลได้";
+      console.error("Fetch error:", error);
+    }
+  }
+
+  fetchData();
+  setInterval(fetchData, 5000);
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// ส่งหน้าเว็บ HTML
+void handleRoot() {
+  server.send_P(200, "text/html", webpage_template);
+}
+
+void setup()
+{
+  pinMode(MAX485_RE_NEG, OUTPUT);
+  pinMode(MAX485_DE, OUTPUT);
+
+  digitalWrite(MAX485_RE_NEG, LOW);
+  digitalWrite(MAX485_DE, LOW);
+
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("Initializing Modbus RTU with ESP32...");
+
+  mySerial.begin(9600, SERIAL_8N1, 17, 16);
+  delay(1000);
+
+  node.begin(1, mySerial);
+  node.preTransmission(preTransmission);
+  node.postTransmission(postTransmission);
+
+  lcd.begin();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Temp & Humidity");
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("Connected. IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // กำหนดเส้นทางเว็บ
+  server.on("/", handleRoot);
+  server.on("/data", handleApiData);
+
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop()
+{
+  server.handleClient();
+
+  uint8_t result;
+  Serial.println("Requesting temp & humidity data...");
+
+  result = node.readInputRegisters(1, 2);
+
+  float temperature = 0.0f;
+  float humidity = 0.0f;
+
+  int count = historyFilled ? HISTORY_SIZE : historyIndex;
+  float avgTemperature = average(tempHistory, count);
+  float avgHumidity = average(humHistory, count);
+
+  if (result == node.ku8MBSuccess) {
+    temperature = node.getResponseBuffer(0) / 10.0f;
+    humidity = node.getResponseBuffer(1) / 10.0f;
+
+    tempHistory[historyIndex] = temperature;
+    humHistory[historyIndex] = humidity;
+
+    historyIndex++;
+    if (historyIndex >= HISTORY_SIZE) {
+      historyIndex = 0;
+      historyFilled = true;
+    }
+
+    count = historyFilled ? HISTORY_SIZE : historyIndex;
+    avgTemperature = average(tempHistory, count);
+    avgHumidity = average(humHistory, count);
+
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.print(" °C, Average: ");
+    Serial.print(avgTemperature);
+    Serial.print(" °C\nHumidity: ");
+    Serial.print(humidity);
+    Serial.print(" %, Average: ");
+    Serial.println(avgHumidity);
+
+    String comfort = checkComfort(avgTemperature, avgHumidity);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Avg Temp: ");
+    lcd.print(avgTemperature, 1);
+    lcd.print(" C");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Avg Hum: ");
+    lcd.print(avgHumidity, 1);
+    lcd.print(" %");
+
+    lcd.setCursor(0, 2);
+    lcd.print("Status:");
+    lcd.setCursor(8, 2);
+    lcd.print(comfort);
+  }
+  else {
+    Serial.print("Failed to read data, error: ");
+    Serial.println(result);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Read error: ");
+    lcd.print(result);
+
+    lcd.setCursor(0, 1);
+    lcd.print("Avg Temp: ");
+    lcd.print(avgTemperature, 1);
+    lcd.print(" C");
+
+    lcd.setCursor(0, 2);
+    lcd.print("Avg Hum: ");
+    lcd.print(avgHumidity, 1);
+    lcd.print(" %");
+  }
+
+  delay(1000);
+}
